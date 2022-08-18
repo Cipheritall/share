@@ -9,9 +9,9 @@ pipeline {
           }
         }
 
-        stage('STEP 1.1') {
+        stage('Step 1.0') {
           steps {
-            mail(subject: 'STEP 1.1', body: 'DONE', from: 'TEST@digitalitangels.com', replyTo: 'TEST@digitalitangels.com', to: 'sami.ezzerouali@hotmail.com')
+            sh 'echo step1.0'
           }
         }
 
