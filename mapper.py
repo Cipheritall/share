@@ -12,7 +12,6 @@ import termios
 import time
 import tty
 
-from collections import defaultdict
 from datetime import datetime
 
 
@@ -24,1213 +23,986 @@ CSV_FILE = "network_services.csv"
 
 INTERFACE = "any"
 
-# Dashboard refresh
 REFRESH_INTERVAL = 1.0
 
-# CSV persistence
 CSV_SAVE_INTERVAL = 10.0
 
-# Remove flows that haven't received traffic for this period
 FLOW_TIMEOUT = 3600
 
-# Number of flows shown on screen
 MAX_DISPLAY_FLOWS = 30
 
 
 # ============================================================
-# GLOBAL STATE
+# NETTOP
 # ============================================================
 
-running = True
+class NetTop:
 
-flows = {}
+    def __init__(self):
 
-total_packets = 0
-total_bytes = 0
+        self.running = True
 
-previous_total_packets = 0
-previous_total_bytes = 0
+        self.tcpdump = None
 
-rx_packets = 0
-tx_packets = 0
+        self.flows = {}
 
-rx_bytes = 0
-tx_bytes = 0
+        self.total_packets = 0
+        self.total_bytes = 0
 
-previous_rx_bytes = 0
-previous_tx_bytes = 0
+        self.rx_packets = 0
+        self.tx_packets = 0
 
-previous_time = time.time()
+        self.rx_bytes = 0
+        self.tx_bytes = 0
 
-tcpdump_process = None
+        self.previous_rx_bytes = 0
+        self.previous_tx_bytes = 0
 
+        self.previous_time = time.time()
 
-# ============================================================
-# TERMINAL
-# ============================================================
+        self.last_refresh = 0
+        self.last_csv_save = 0
+        self.last_ip_refresh = 0
 
-def clear_screen():
-    print("\033[2J\033[H", end="")
+        self.local_ips = set()
 
+        self.service_cache = {}
 
-def hide_cursor():
-    print("\033[?25l", end="")
+        self.old_terminal = None
 
+    # ========================================================
+    # TERMINAL
+    # ========================================================
 
-def show_cursor():
-    print("\033[?25h", end="")
+    @staticmethod
+    def clear_screen():
 
+        print("\033[2J\033[H", end="")
 
-def move_home():
-    print("\033[H", end="")
+    @staticmethod
+    def hide_cursor():
 
+        print("\033[?25l", end="")
 
-def bold(text):
-    return f"\033[1m{text}\033[0m"
+    @staticmethod
+    def show_cursor():
 
+        print("\033[?25h", end="")
 
-def cyan(text):
-    return f"\033[36m{text}\033[0m"
+    # ========================================================
+    # LOCAL IPs
+    # ========================================================
 
+    def get_local_ips(self):
 
-def green(text):
-    return f"\033[32m{text}\033[0m"
+        try:
 
+            output = subprocess.check_output(
+                [
+                    "ip",
+                    "-4",
+                    "-o",
+                    "addr",
+                    "show"
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL
+            )
 
-def yellow(text):
-    return f"\033[33m{text}\033[0m"
+            ips = set()
 
+            for line in output.splitlines():
 
-def red(text):
-    return f"\033[31m{text}\033[0m"
+                parts = line.split()
 
+                if len(parts) >= 4:
 
-def grey(text):
-    return f"\033[90m{text}\033[0m"
+                    ip = parts[3].split("/")[0]
 
+                    ips.add(ip)
 
-# ============================================================
-# LOCAL IP DETECTION
-# ============================================================
+            return ips
 
-def get_local_ips():
+        except Exception:
 
-    try:
+            return set()
 
-        output = subprocess.check_output(
-            [
-                "ip",
-                "-4",
-                "-o",
-                "addr",
-                "show",
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
+    # ========================================================
+    # SERVICE LOOKUP
+    # ========================================================
+
+    def get_service(self, port, protocol):
+
+        if port in ("", "-", None):
+
+            return "-"
+
+        try:
+
+            port = int(port)
+
+        except (ValueError, TypeError):
+
+            return "-"
+
+        key = (port, protocol)
+
+        if key in self.service_cache:
+
+            return self.service_cache[key]
+
+        try:
+
+            service = socket.getservbyport(
+                port,
+                protocol.lower()
+            )
+
+        except OSError:
+
+            service = "-"
+
+        self.service_cache[key] = service
+
+        return service
+
+    # ========================================================
+    # ENDPOINT PARSER
+    # ========================================================
+
+    @staticmethod
+    def parse_endpoint(endpoint):
+
+        endpoint = endpoint.rstrip(":")
+
+        match = re.match(
+            r"^(\d+\.\d+\.\d+\.\d+)\.(\d+)$",
+            endpoint
         )
 
-        ips = set()
+        if match:
 
-        for line in output.splitlines():
+            return (
+                match.group(1),
+                match.group(2)
+            )
+
+        return endpoint, "-"
+
+    # ========================================================
+    # PACKET PARSER
+    # ========================================================
+
+    def parse_packet(self, line):
+
+        try:
+
+            if " > " not in line:
+
+                return None
 
             parts = line.split()
 
-            if len(parts) >= 4:
+            # ------------------------------------------------
+            # Protocol
+            # ------------------------------------------------
 
-                address = parts[3]
+            if "Flags" in line:
 
-                ip = address.split("/")[0]
+                protocol = "TCP"
 
-                ips.add(ip)
+            elif re.search(
+                r"\budp\b",
+                line,
+                re.IGNORECASE
+            ):
 
-        return ips
+                protocol = "UDP"
 
-    except Exception:
+            elif re.search(
+                r"\bicmp\b",
+                line,
+                re.IGNORECASE
+            ):
 
-        return set()
+                protocol = "ICMP"
 
+            else:
 
-# ============================================================
-# SERVICE LOOKUP
-# ============================================================
+                return None
 
-service_cache = {}
+            # ------------------------------------------------
+            # Find >
+            # ------------------------------------------------
 
+            arrow_index = -1
 
-def get_service(port, protocol):
+            for i, part in enumerate(parts):
 
-    if port in ("", "-", None):
-        return "-"
+                if part == ">":
 
-    try:
-        port = int(port)
-    except Exception:
-        return "-"
+                    arrow_index = i
 
-    key = (port, protocol)
+                    break
 
-    if key in service_cache:
-        return service_cache[key]
+            if arrow_index <= 0:
 
-    try:
+                return None
 
-        service = socket.getservbyport(
-            port,
-            protocol.lower()
-        )
+            src_raw = parts[arrow_index - 1]
 
-    except Exception:
+            dst_raw = parts[arrow_index + 1]
 
-        service = "-"
+            src_ip, src_port = self.parse_endpoint(
+                src_raw
+            )
 
-    service_cache[key] = service
+            dst_ip, dst_port = self.parse_endpoint(
+                dst_raw
+            )
 
-    return service
+            # ------------------------------------------------
+            # Only traffic involving this host
+            # ------------------------------------------------
 
+            if src_ip in self.local_ips:
 
-# ============================================================
-# PORT PROCESS LOOKUP
-# ============================================================
+                direction = "OUT"
 
-def get_listening_services():
+            elif dst_ip in self.local_ips:
 
-    services = {}
+                direction = "IN"
 
-    try:
+            else:
 
-        output = subprocess.check_output(
-            [
-                "ss",
-                "-lntup"
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
+                return None
 
-        for line in output.splitlines():
+            # ------------------------------------------------
+            # Packet length
+            # ------------------------------------------------
 
-            if line.startswith("Netid"):
-                continue
-
-            parts = line.split()
-
-            if len(parts) < 5:
-                continue
-
-            protocol = parts[0]
-
-            local = parts[4]
-
-            process = ""
-
-            if len(parts) >= 7:
-                process = parts[-1]
+            packet_size = 0
 
             match = re.search(
-                r":(\d+)$",
-                local
+                r"length\s+(\d+)",
+                line
             )
 
-            if not match:
-                continue
+            if match:
 
-            port = match.group(1)
-
-            services[(protocol.upper(), port)] = process
-
-    except Exception:
-        pass
-
-    return services
-
-
-# ============================================================
-# FLOW KEY
-# ============================================================
-
-def make_flow_key(packet):
-
-    """
-    Aggregate connections by:
-
-        direction
-        protocol
-        local_port
-        remote_ip
-        remote_port
-
-    This intentionally ignores the ephemeral local source port.
-
-    Example:
-
-        host:50001 -> 1.2.3.4:443
-        host:50002 -> 1.2.3.4:443
-        host:50003 -> 1.2.3.4:443
-
-    becomes ONE flow.
-    """
-
-    direction = packet["direction"]
-
-    protocol = packet["protocol"]
-
-    if direction == "OUT":
-
-        local_port = packet["src_port"]
-
-        remote_ip = packet["dst_ip"]
-
-        remote_port = packet["dst_port"]
-
-    else:
-
-        local_port = packet["dst_port"]
-
-        remote_ip = packet["src_ip"]
-
-        remote_port = packet["src_port"]
-
-    return (
-        direction,
-        protocol,
-        local_port,
-        remote_ip,
-        remote_port,
-    )
-
-
-# ============================================================
-# TCPDUMP PARSER
-# ============================================================
-
-def parse_endpoint(endpoint):
-
-    endpoint = endpoint.rstrip(":")
-
-    # IPv4
-    match = re.match(
-        r"^(\d+\.\d+\.\d+\.\d+)\.(\d+)$",
-        endpoint
-    )
-
-    if match:
-
-        return (
-            match.group(1),
-            match.group(2),
-        )
-
-    return endpoint, "-"
-
-
-def parse_packet(line, local_ips):
-
-    """
-    Parse tcpdump -tt -n -q output.
-
-    Example:
-
-    1759051234.123456 IP 192.168.1.10.50001 >
-    142.250.185.14.443: tcp 0
-
-    """
-
-    try:
-
-        if " > " not in line:
-            return None
-
-        parts = line.split()
-
-        # ----------------------------------------------------
-        # Protocol
-        # ----------------------------------------------------
-
-        if "IP " not in line and not "IP6 " in line:
-            return None
-
-        if "Flags" in line:
-            protocol = "TCP"
-
-        elif "udp" in line.lower():
-            protocol = "UDP"
-
-        elif "icmp" in line.lower():
-            protocol = "ICMP"
-
-        else:
-            return None
-
-        # ----------------------------------------------------
-        # Find endpoints
-        # ----------------------------------------------------
-
-        arrow_index = -1
-
-        for i, part in enumerate(parts):
-
-            if part == ">":
-
-                arrow_index = i
-                break
-
-        if arrow_index <= 0:
-            return None
-
-        src_raw = parts[arrow_index - 1]
-
-        dst_raw = parts[arrow_index + 1]
-
-        src_ip, src_port = parse_endpoint(src_raw)
-
-        dst_ip, dst_port = parse_endpoint(dst_raw)
-
-        # ----------------------------------------------------
-        # Validate IPs
-        # ----------------------------------------------------
-
-        if src_ip not in local_ips and dst_ip not in local_ips:
-
-            return None
-
-        # ----------------------------------------------------
-        # Direction
-        # ----------------------------------------------------
-
-        if src_ip in local_ips:
-
-            direction = "OUT"
-
-        elif dst_ip in local_ips:
-
-            direction = "IN"
-
-        else:
-
-            return None
-
-        # ----------------------------------------------------
-        # Packet size
-        # ----------------------------------------------------
-
-        packet_size = 0
-
-        length_match = re.search(
-            r"length\s+(\d+)",
-            line
-        )
-
-        if length_match:
-
-            packet_size = int(
-                length_match.group(1)
-            )
-
-        return {
-
-            "direction": direction,
-
-            "protocol": protocol,
-
-            "src_ip": src_ip,
-
-            "src_port": src_port,
-
-            "dst_ip": dst_ip,
-
-            "dst_port": dst_port,
-
-            "bytes": packet_size,
-
-        }
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# START TCPDUMP
-# ============================================================
-
-def start_tcpdump():
-
-    return subprocess.Popen(
-
-        [
-            "tcpdump",
-
-            "-i",
-            INTERFACE,
-
-            "-n",
-
-            "-l",
-
-            "-tt",
-
-            "-q",
-
-        ],
-
-        stdout=subprocess.PIPE,
-
-        stderr=subprocess.DEVNULL,
-
-        text=True,
-
-        bufsize=1,
-
-    )
-
-
-# ============================================================
-# PROCESS PACKET
-# ============================================================
-
-def process_packet(packet):
-
-    global total_packets
-    global total_bytes
-
-    global rx_packets
-    global tx_packets
-
-    global rx_bytes
-    global tx_bytes
-
-    now = time.time()
-
-    key = make_flow_key(packet)
-
-    # --------------------------------------------------------
-    # Create flow
-    # --------------------------------------------------------
-
-    if key not in flows:
-
-        flows[key] = {
-
-            "direction":
-                packet["direction"],
-
-            "protocol":
-                packet["protocol"],
-
-            "local_port":
-                packet["src_port"]
-                if packet["direction"] == "OUT"
-                else packet["dst_port"],
-
-            "remote_ip":
-                packet["dst_ip"]
-                if packet["direction"] == "OUT"
-                else packet["src_ip"],
-
-            "remote_port":
-                packet["dst_port"]
-                if packet["direction"] == "OUT"
-                else packet["src_port"],
-
-            "packets": 0,
-
-            "bytes": 0,
-
-            "first_seen": now,
-
-            "last_seen": now,
-
-        }
-
-    # --------------------------------------------------------
-    # Update flow
-    # --------------------------------------------------------
-
-    flow = flows[key]
-
-    flow["packets"] += 1
-
-    flow["bytes"] += packet["bytes"]
-
-    flow["last_seen"] = now
-
-    # --------------------------------------------------------
-    # Global counters
-    # --------------------------------------------------------
-
-    total_packets += 1
-
-    total_bytes += packet["bytes"]
-
-    if packet["direction"] == "IN":
-
-        rx_packets += 1
-
-        rx_bytes += packet["bytes"]
-
-    else:
-
-        tx_packets += 1
-
-        tx_bytes += packet["bytes"]
-
-
-# ============================================================
-# CLEANUP FLOWS
-# ============================================================
-
-def cleanup_flows():
-
-    now = time.time()
-
-    expired = []
-
-    for key, flow in flows.items():
-
-        if now - flow["last_seen"] > FLOW_TIMEOUT:
-
-            expired.append(key)
-
-    for key in expired:
-
-        del flows[key]
-
-
-# ============================================================
-# SAVE CSV
-# ============================================================
-
-def save_csv():
-
-    temporary_file = CSV_FILE + ".tmp"
-
-    try:
-
-        with open(
-            temporary_file,
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as f:
-
-            writer = csv.writer(f)
-
-            writer.writerow([
-                "direction",
-                "protocol",
-                "local_port",
-                "local_service",
-                "remote_ip",
-                "remote_port",
-                "remote_service",
-                "packets",
-                "bytes",
-                "first_seen",
-                "last_seen",
-            ])
-
-            for flow in flows.values():
-
-                protocol = flow["protocol"]
-
-                local_port = flow["local_port"]
-
-                remote_port = flow["remote_port"]
-
-                local_service = get_service(
-                    local_port,
-                    protocol
+                packet_size = int(
+                    match.group(1)
                 )
 
-                remote_service = get_service(
-                    remote_port,
-                    protocol
-                )
+            return {
+                "direction": direction,
+                "protocol": protocol,
+                "src_ip": src_ip,
+                "src_port": src_port,
+                "dst_ip": dst_ip,
+                "dst_port": dst_port,
+                "bytes": packet_size
+            }
 
-                writer.writerow([
+        except Exception:
 
-                    flow["direction"],
+            return None
 
-                    protocol,
+    # ========================================================
+    # FLOW KEY
+    # ========================================================
 
-                    local_port,
+    @staticmethod
+    def make_flow_key(packet):
 
-                    local_service,
+        direction = packet["direction"]
 
-                    flow["remote_ip"],
-
-                    remote_port,
-
-                    remote_service,
-
-                    flow["packets"],
-
-                    flow["bytes"],
-
-                    datetime.fromtimestamp(
-                        flow["first_seen"]
-                    ).isoformat(),
-
-                    datetime.fromtimestamp(
-                        flow["last_seen"]
-                    ).isoformat(),
-
-                ])
-
-            f.flush()
-
-            os.fsync(f.fileno())
-
-        # Atomic replacement
-        os.replace(
-            temporary_file,
-            CSV_FILE
-        )
-
-    except Exception as e:
-
-        print(
-            f"\nCSV error: {e}",
-            file=sys.stderr
-        )
-
-
-# ============================================================
-# FORMAT BYTES
-# ============================================================
-
-def format_bytes(value):
-
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    ]
-
-    value = float(value)
-
-    for unit in units:
-
-        if value < 1024:
-
-            return f"{value:.1f}{unit}"
-
-        value /= 1024
-
-    return f"{value:.1f}PB"
-
-
-# ============================================================
-# FORMAT RATE
-# ============================================================
-
-def format_rate(value):
-
-    return format_bytes(value) + "/s"
-
-
-# ============================================================
-# RESET
-# ============================================================
-
-def reset_statistics():
-
-    global flows
-
-    global total_packets
-    global total_bytes
-
-    global rx_packets
-    global tx_packets
-
-    global rx_bytes
-    global tx_bytes
-
-    flows = {}
-
-    total_packets = 0
-    total_bytes = 0
-
-    rx_packets = 0
-    tx_packets = 0
-
-    rx_bytes = 0
-    tx_bytes = 0
-
-    save_csv()
-
-
-# ============================================================
-# KEYBOARD
-# ============================================================
-
-def keyboard_available():
-
-    return select.select(
-        [sys.stdin],
-        [],
-        [],
-        0
-    )[0]
-
-
-def read_key():
-
-    if not keyboard_available():
-        return None
-
-    return sys.stdin.read(1)
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-def render(local_ips, rx_rate, tx_rate):
-
-    clear_screen()
-
-    terminal_width = 120
-
-    print(
-        bold(cyan("NETTOP"))
-        + " "
-        + datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    )
-
-    print()
-
-    print(
-        f"Interface : {INTERFACE}"
-    )
-
-    print(
-        f"Local IPs : "
-        f"{', '.join(sorted(local_ips))}"
-    )
-
-    print()
-
-    print(
-        f"RX: {green(format_rate(rx_rate))}"
-        f"    "
-        f"TX: {yellow(format_rate(tx_rate))}"
-        f"    "
-        f"Flows: {len(flows):,}"
-        f"    "
-        f"Packets: {total_packets:,}"
-        f"    "
-        f"Traffic: {format_bytes(total_bytes)}"
-    )
-
-    print()
-
-    header = (
-        f"{'DIR':<5}"
-        f"{'PROTO':<7}"
-        f"{'LOCAL':<22}"
-        f"{'REMOTE':<25}"
-        f"{'SERVICE':<18}"
-        f"{'PACKETS':>10}"
-        f"{'BYTES':>12}"
-    )
-
-    print(bold(header))
-
-    print("-" * min(
-        terminal_width,
-        len(header)
-    ))
-
-    # --------------------------------------------------------
-    # Sort by bytes
-    # --------------------------------------------------------
-
-    sorted_flows = sorted(
-
-        flows.values(),
-
-        key=lambda f: f["bytes"],
-
-        reverse=True,
-
-    )
-
-    for flow in sorted_flows[
-        :MAX_DISPLAY_FLOWS
-    ]:
-
-        direction = flow["direction"]
-
-        protocol = flow["protocol"]
-
-        local_port = flow["local_port"]
-
-        remote_ip = flow["remote_ip"]
-
-        remote_port = flow["remote_port"]
-
-        local_service = get_service(
-            local_port,
-            protocol
-        )
-
-        remote_service = get_service(
-            remote_port,
-            protocol
-        )
+        protocol = packet["protocol"]
 
         if direction == "OUT":
 
-            local = f":{local_port}"
+            local_port = packet["src_port"]
 
-            remote = (
-                f"{remote_ip}:"
-                f"{remote_port}"
-            )
+            remote_ip = packet["dst_ip"]
 
-            service = local_service
+            remote_port = packet["dst_port"]
 
         else:
 
-            local = f":{local_port}"
+            local_port = packet["dst_port"]
 
-            remote = (
-                f"{remote_ip}:"
-                f"{remote_port}"
-            )
+            remote_ip = packet["src_ip"]
 
-            service = local_service
+            remote_port = packet["src_port"]
 
-        if len(service) > 17:
-
-            service = service[:17]
-
-        print(
-
-            f"{direction:<5}"
-
-            f"{protocol:<7}"
-
-            f"{local:<22}"
-
-            f"{remote:<25}"
-
-            f"{service:<18}"
-
-            f"{flow['packets']:>10,}"
-
-            f"{format_bytes(flow['bytes']):>12}"
-
+        return (
+            direction,
+            protocol,
+            local_port,
+            remote_ip,
+            remote_port
         )
 
-    print()
+    # ========================================================
+    # PROCESS PACKET
+    # ========================================================
 
-    print(
-        grey(
-            "q: quit    "
-            "r: reset    "
-            "CSV: " + CSV_FILE
+    def process_packet(self, packet):
+
+        now = time.time()
+
+        key = self.make_flow_key(packet)
+
+        if key not in self.flows:
+
+            if packet["direction"] == "OUT":
+
+                local_port = packet["src_port"]
+
+                remote_ip = packet["dst_ip"]
+
+                remote_port = packet["dst_port"]
+
+            else:
+
+                local_port = packet["dst_port"]
+
+                remote_ip = packet["src_ip"]
+
+                remote_port = packet["src_port"]
+
+            self.flows[key] = {
+
+                "direction": packet["direction"],
+
+                "protocol": packet["protocol"],
+
+                "local_port": local_port,
+
+                "remote_ip": remote_ip,
+
+                "remote_port": remote_port,
+
+                "packets": 0,
+
+                "bytes": 0,
+
+                "first_seen": now,
+
+                "last_seen": now
+            }
+
+        flow = self.flows[key]
+
+        flow["packets"] += 1
+
+        flow["bytes"] += packet["bytes"]
+
+        flow["last_seen"] = now
+
+        self.total_packets += 1
+
+        self.total_bytes += packet["bytes"]
+
+        if packet["direction"] == "IN":
+
+            self.rx_packets += 1
+
+            self.rx_bytes += packet["bytes"]
+
+        else:
+
+            self.tx_packets += 1
+
+            self.tx_bytes += packet["bytes"]
+
+    # ========================================================
+    # START TCPDUMP
+    # ========================================================
+
+    def start_tcpdump(self):
+
+        return subprocess.Popen(
+            [
+                "tcpdump",
+                "-i",
+                INTERFACE,
+                "-n",
+                "-l",
+                "-tt",
+                "-q"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1
         )
-    )
 
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
-# ============================================================
-# SIGNAL HANDLING
-# ============================================================
+    def cleanup_flows(self):
 
-def stop(signum=None, frame=None):
+        now = time.time()
 
-    global running
+        expired = []
 
-    running = False
+        for key, flow in self.flows.items():
 
+            if (
+                now - flow["last_seen"]
+                > FLOW_TIMEOUT
+            ):
 
-signal.signal(
-    signal.SIGINT,
-    stop
-)
+                expired.append(key)
 
-signal.signal(
-    signal.SIGTERM,
-    stop
-)
+        for key in expired:
 
+            del self.flows[key]
 
-# ============================================================
-# MAIN
-# ============================================================
+    # ========================================================
+    # SAVE CSV
+    # ========================================================
 
-def main():
+    def save_csv(self):
 
-    global tcpdump_process
+        temporary_file = CSV_FILE + ".tmp"
 
-    global previous_total_packets
-    global previous_total_bytes
+        try:
 
-    global previous_rx_bytes
-    global previous_tx_bytes
+            with open(
+                temporary_file,
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as file:
 
-    global previous_time
+                writer = csv.writer(file)
 
-    # --------------------------------------------------------
-    # Check tcpdump
-    # --------------------------------------------------------
+                writer.writerow([
+                    "direction",
+                    "protocol",
+                    "local_port",
+                    "local_service",
+                    "remote_ip",
+                    "remote_port",
+                    "remote_service",
+                    "packets",
+                    "bytes",
+                    "first_seen",
+                    "last_seen"
+                ])
 
-    if os.geteuid() != 0:
+                for flow in self.flows.values():
 
-        print(
-            "Run with sudo:",
-            file=sys.stderr
-        )
+                    protocol = flow["protocol"]
 
-        print(
-            f"sudo {sys.argv[0]}",
-            file=sys.stderr
-        )
+                    local_port = flow["local_port"]
 
-        sys.exit(1)
+                    remote_port = flow["remote_port"]
 
-    # --------------------------------------------------------
-    # Initial IP detection
-    # --------------------------------------------------------
-
-    local_ips = get_local_ips()
-
-    if not local_ips:
-
-        print(
-            "Could not determine local IP addresses.",
-            file=sys.stderr
-        )
-
-        sys.exit(1)
-
-    # --------------------------------------------------------
-    # Terminal raw mode
-    # --------------------------------------------------------
-
-    old_terminal = termios.tcgetattr(
-        sys.stdin
-    )
-
-    tty.setcbreak(
-        sys.stdin.fileno()
-    )
-
-    hide_cursor()
-
-    clear_screen()
-
-    try:
-
-        # ----------------------------------------------------
-        # Start tcpdump
-        # ----------------------------------------------------
-
-        tcpdump_process = start_tcpdump()
-
-        last_refresh = 0
-
-        last_csv_save = 0
-
-        last_ip_refresh = 0
-
-        while running:
-
-            # ------------------------------------------------
-            # Restart tcpdump if it dies
-            # ------------------------------------------------
-
-            if tcpdump_process.poll() is not None:
-
-                time.sleep(1)
-
-                if not running:
-                    break
-
-                tcpdump_process = start_tcpdump()
-
-            # ------------------------------------------------
-            # Read packet
-            # ------------------------------------------------
-
-            readable, _, _ = select.select(
-
-                [tcpdump_process.stdout],
-
-                [],
-
-                [],
-
-                0.1
-
-            )
-
-            if readable:
-
-                line = (
-                    tcpdump_process.stdout.readline()
-                )
-
-                if line:
-
-                    packet = parse_packet(
-                        line.strip(),
-                        local_ips
+                    local_service = self.get_service(
+                        local_port,
+                        protocol
                     )
 
-                    if packet:
+                    remote_service = self.get_service(
+                        remote_port,
+                        protocol
+                    )
 
-                        process_packet(
-                            packet
+                    writer.writerow([
+
+                        flow["direction"],
+
+                        protocol,
+
+                        local_port,
+
+                        local_service,
+
+                        flow["remote_ip"],
+
+                        remote_port,
+
+                        remote_service,
+
+                        flow["packets"],
+
+                        flow["bytes"],
+
+                        datetime.fromtimestamp(
+                            flow["first_seen"]
+                        ).isoformat(),
+
+                        datetime.fromtimestamp(
+                            flow["last_seen"]
+                        ).isoformat()
+                    ])
+
+                file.flush()
+
+                os.fsync(file.fileno())
+
+            # Atomic replacement
+            os.replace(
+                temporary_file,
+                CSV_FILE
+            )
+
+        except Exception as exc:
+
+            print(
+                f"\nCSV error: {exc}",
+                file=sys.stderr
+            )
+
+    # ========================================================
+    # FORMAT BYTES
+    # ========================================================
+
+    @staticmethod
+    def format_bytes(value):
+
+        value = float(value)
+
+        units = [
+            "B",
+            "KB",
+            "MB",
+            "GB",
+            "TB"
+        ]
+
+        for unit in units:
+
+            if value < 1024:
+
+                return f"{value:.1f}{unit}"
+
+            value /= 1024
+
+        return f"{value:.1f}PB"
+
+    # ========================================================
+    # DASHBOARD
+    # ========================================================
+
+    def render(self, rx_rate, tx_rate):
+
+        self.clear_screen()
+
+        print(
+            "\033[1;36m"
+            "NETTOP"
+            "\033[0m"
+            "   "
+            + datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+        print()
+
+        print(
+            f"Interface : {INTERFACE}"
+        )
+
+        print(
+            "Local IPs : "
+            + ", ".join(
+                sorted(self.local_ips)
+            )
+        )
+
+        print()
+
+        print(
+            f"RX {self.format_bytes(rx_rate)}/s"
+            f"    "
+            f"TX {self.format_bytes(tx_rate)}/s"
+            f"    "
+            f"Flows {len(self.flows):,}"
+            f"    "
+            f"Packets {self.total_packets:,}"
+            f"    "
+            f"Traffic {self.format_bytes(self.total_bytes)}"
+        )
+
+        print()
+
+        print(
+            f"{'DIR':<5}"
+            f"{'PROTO':<7}"
+            f"{'LOCAL':<12}"
+            f"{'REMOTE':<26}"
+            f"{'SERVICE':<18}"
+            f"{'PACKETS':>10}"
+            f"{'BYTES':>12}"
+        )
+
+        print("-" * 100)
+
+        sorted_flows = sorted(
+            self.flows.values(),
+            key=lambda flow: flow["bytes"],
+            reverse=True
+        )
+
+        for flow in sorted_flows[
+            :MAX_DISPLAY_FLOWS
+        ]:
+
+            local_port = flow["local_port"]
+
+            remote = (
+                f"{flow['remote_ip']}:"
+                f"{flow['remote_port']}"
+            )
+
+            service = self.get_service(
+                local_port,
+                flow["protocol"]
+            )
+
+            print(
+
+                f"{flow['direction']:<5}"
+
+                f"{flow['protocol']:<7}"
+
+                f":{local_port:<11}"
+
+                f"{remote:<26}"
+
+                f"{service:<18}"
+
+                f"{flow['packets']:>10,}"
+
+                f"{self.format_bytes(flow['bytes']):>12}"
+            )
+
+        print()
+
+        print(
+            "\033[90m"
+            "q: quit    "
+            "r: reset    "
+            f"CSV: {CSV_FILE}"
+            "\033[0m"
+        )
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset(self):
+
+        self.flows.clear()
+
+        self.total_packets = 0
+        self.total_bytes = 0
+
+        self.rx_packets = 0
+        self.tx_packets = 0
+
+        self.rx_bytes = 0
+        self.tx_bytes = 0
+
+        self.previous_rx_bytes = 0
+        self.previous_tx_bytes = 0
+
+        self.save_csv()
+
+    # ========================================================
+    # KEYBOARD
+    # ========================================================
+
+    @staticmethod
+    def key_available():
+
+        readable, _, _ = select.select(
+            [sys.stdin],
+            [],
+            [],
+            0
+        )
+
+        return bool(readable)
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    def run(self):
+
+        if os.geteuid() != 0:
+
+            print(
+                "This program must be run as root."
+            )
+
+            print()
+
+            print(
+                f"Run: sudo {sys.argv[0]}"
+            )
+
+            sys.exit(1)
+
+        self.local_ips = self.get_local_ips()
+
+        if not self.local_ips:
+
+            print(
+                "Unable to determine local IP addresses."
+            )
+
+            sys.exit(1)
+
+        self.old_terminal = termios.tcgetattr(
+            sys.stdin
+        )
+
+        tty.setcbreak(
+            sys.stdin.fileno()
+        )
+
+        self.hide_cursor()
+
+        self.clear_screen()
+
+        try:
+
+            self.tcpdump = self.start_tcpdump()
+
+            while self.running:
+
+                # --------------------------------------------
+                # Read tcpdump
+                # --------------------------------------------
+
+                if self.tcpdump.poll() is not None:
+
+                    time.sleep(1)
+
+                    if self.running:
+
+                        self.tcpdump = (
+                            self.start_tcpdump()
                         )
 
-            # ------------------------------------------------
-            # Keyboard
-            # ------------------------------------------------
+                    continue
 
-            key = read_key()
+                readable, _, _ = select.select(
 
-            if key:
+                    [self.tcpdump.stdout],
 
-                if key.lower() == "q":
+                    [],
 
-                    running = False
+                    [],
 
-                    break
-
-                elif key.lower() == "r":
-
-                    reset_statistics()
-
-            # ------------------------------------------------
-            # Refresh IP addresses
-            # ------------------------------------------------
-
-            now = time.time()
-
-            if now - last_ip_refresh > 10:
-
-                local_ips = get_local_ips()
-
-                last_ip_refresh = now
-
-            # ------------------------------------------------
-            # Dashboard refresh
-            # ------------------------------------------------
-
-            if now - last_refresh >= REFRESH_INTERVAL:
-
-                elapsed = (
-                    now - previous_time
+                    0.1
                 )
 
-                if elapsed <= 0:
-                    elapsed = 1
+                if readable:
 
-                rx_rate = (
-                    rx_bytes -
-                    previous_rx_bytes
-                ) / elapsed
+                    line = (
+                        self.tcpdump.stdout.readline()
+                    )
 
-                tx_rate = (
-                    tx_bytes -
-                    previous_tx_bytes
-                ) / elapsed
+                    if line:
 
-                render(
-                    local_ips,
-                    rx_rate,
-                    tx_rate
-                )
+                        packet = self.parse_packet(
+                            line.strip()
+                        )
 
-                previous_rx_bytes = rx_bytes
+                        if packet:
 
-                previous_tx_bytes = tx_bytes
+                            self.process_packet(
+                                packet
+                            )
 
-                previous_total_packets = (
-                    total_packets
-                )
+                # --------------------------------------------
+                # Keyboard
+                # --------------------------------------------
 
-                previous_total_bytes = (
-                    total_bytes
-                )
+                if self.key_available():
 
-                previous_time = now
+                    key = sys.stdin.read(1)
 
-                last_refresh = now
+                    if key.lower() == "q":
 
-            # ------------------------------------------------
-            # Save CSV
-            # ------------------------------------------------
+                        self.running = False
 
-            if now - last_csv_save >= CSV_SAVE_INTERVAL:
+                    elif key.lower() == "r":
 
-                cleanup_flows()
+                        self.reset()
 
-                save_csv()
+                now = time.time()
 
-                last_csv_save = now
+                # --------------------------------------------
+                # Refresh local IPs
+                # --------------------------------------------
 
-    finally:
+                if (
+                    now - self.last_ip_refresh
+                    >= 10
+                ):
 
-        running = False
+                    self.local_ips = (
+                        self.get_local_ips()
+                    )
 
-        # ----------------------------------------------------
-        # Stop tcpdump
-        # ----------------------------------------------------
+                    self.last_ip_refresh = now
 
-        if tcpdump_process:
+                # --------------------------------------------
+                # Dashboard
+                # --------------------------------------------
+
+                if (
+                    now - self.last_refresh
+                    >= REFRESH_INTERVAL
+                ):
+
+                    elapsed = (
+                        now - self.previous_time
+                    )
+
+                    if elapsed <= 0:
+
+                        elapsed = 1
+
+                    rx_rate = (
+
+                        self.rx_bytes
+                        - self.previous_rx_bytes
+
+                    ) / elapsed
+
+                    tx_rate = (
+
+                        self.tx_bytes
+                        - self.previous_tx_bytes
+
+                    ) / elapsed
+
+                    self.render(
+                        rx_rate,
+                        tx_rate
+                    )
+
+                    self.previous_rx_bytes = (
+                        self.rx_bytes
+                    )
+
+                    self.previous_tx_bytes = (
+                        self.tx_bytes
+                    )
+
+                    self.previous_time = now
+
+                    self.last_refresh = now
+
+                # --------------------------------------------
+                # CSV
+                # --------------------------------------------
+
+                if (
+                    now - self.last_csv_save
+                    >= CSV_SAVE_INTERVAL
+                ):
+
+                    self.cleanup_flows()
+
+                    self.save_csv()
+
+                    self.last_csv_save = now
+
+        finally:
+
+            self.stop()
+
+    # ========================================================
+    # STOP
+    # ========================================================
+
+    def stop(self):
+
+        self.running = False
+
+        if self.tcpdump:
 
             try:
 
-                tcpdump_process.terminate()
+                self.tcpdump.terminate()
 
-                tcpdump_process.wait(
+                self.tcpdump.wait(
                     timeout=2
                 )
 
             except Exception:
 
                 try:
-                    tcpdump_process.kill()
+
+                    self.tcpdump.kill()
+
                 except Exception:
+
                     pass
 
-        # ----------------------------------------------------
-        # Final CSV save
-        # ----------------------------------------------------
+        # Final CSV
+        self.save_csv()
 
-        save_csv()
+        if self.old_terminal:
 
-        # ----------------------------------------------------
-        # Restore terminal
-        # ----------------------------------------------------
+            try:
 
-        termios.tcsetattr(
-            sys.stdin,
-            termios.TCSADRAIN,
-            old_terminal
-        )
+                termios.tcsetattr(
+                    sys.stdin,
+                    termios.TCSADRAIN,
+                    self.old_terminal
+                )
 
-        show_cursor()
+            except Exception:
 
-        clear_screen()
+                pass
 
-        print(
-            "NETTOP stopped."
-        )
+        self.show_cursor()
+
+        self.clear_screen()
+
+        print("NETTOP stopped.")
 
 
 # ============================================================
-# ENTRY POINT
+# SIGNALS
+# ============================================================
+
+app = NetTop()
+
+
+def signal_handler(signum, frame):
+
+    app.running = False
+
+
+signal.signal(
+    signal.SIGINT,
+    signal_handler
+)
+
+signal.signal(
+    signal.SIGTERM,
+    signal_handler
+)
+
+
+# ============================================================
+# START
 # ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    app.run()
