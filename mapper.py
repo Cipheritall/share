@@ -208,7 +208,13 @@ class NetTop:
             # Protocol
             # ------------------------------------------------
 
-            if "Flags" in line:
+            # With "tcpdump -q", TCP lines read "... > a.b.c.d.port: tcp 52"
+            # (no "Flags"), so match the keyword as well.
+            if "Flags" in line or re.search(
+                r"\btcp\b",
+                line,
+                re.IGNORECASE
+            ):
 
                 protocol = "TCP"
 
@@ -282,8 +288,9 @@ class NetTop:
             packet_size = 0
 
             match = re.search(
-                r"length\s+(\d+)",
-                line
+                r"(?:\blength|\btcp)\s+(\d+)",
+                line,
+                re.IGNORECASE
             )
 
             if match:
